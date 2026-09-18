@@ -5,6 +5,7 @@ __pycache__
 .env
 .dev.vars
 /scratch/
+/.scratch/
 /.coverage
 env*/
 /TODO.md

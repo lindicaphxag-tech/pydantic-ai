@@ -1,6 +1,7 @@
 from __future__ import annotations as _annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+import re
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -74,6 +75,7 @@ __all__ = (
     'TypeSafeModel',
     'TypeSafeModelName',
     'TypeSafeModelSettings',
+    'TypeSafeTextExtractor',
     'TypeSafeStreamedResponse',
     'LatestTypeSafeModelNames',
     'ToolCallProposed',
@@ -87,11 +89,21 @@ threshold has been tuned against one. https://docs.typesafe.ai/models"""
 TypeSafeModelName = str | LatestTypeSafeModelNames
 """Possible TypeSafe model names."""
 
+TypeSafeTextExtractor = Callable[[JSONContent], Iterable[str]]
+"""A function that extracts candidate values for one string output field from the state Jev judges."""
+
+# Jev picks from at most this many options in one question; a 256th is a 400 from the API.
+# https://docs.typesafe.ai/model-jaggedness/jev-1.13
+_MAX_CHOICE_OPTIONS = 255
+
 _UNSUPPORTED_FIELD_HINT = (
-    'Use `bool`, a `Literal` or `Enum` of two or more strings, a `float` bounded with `ge=0` and `le=1`, a `list` of '
-    'a `Literal` or `Enum`, a rubric of whole numbers from 0 with a description per level in its schema, or a model '
-    'of these.'
+    'Use `bool`, a `Literal` or `Enum` of two or more strings, a `str` with a candidate extractor, a `float` bounded '
+    'with `ge=0` and `le=1`, a `list` of a `Literal` or `Enum`, a rubric of whole numbers from 0 with a description '
+    'per level in its schema, or a model of these.'
 )
+
+_EMAIL_PATTERN = re.compile(r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_%+-])')
+_URI_PATTERN = re.compile(r"""\b[A-Za-z][A-Za-z0-9+.-]*:[^\s<>"'()[\]{}]+""")
 
 
 class TypeSafeModelSettings(ModelSettings, total=False):
@@ -168,6 +180,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     |---|---|---|
     | `bool` | yes or no | `True` when Jev's probability is at least 0.5 |
     | `Literal[...]` or `Enum` of strings | pick one | the chosen option |
+    | `str` with a schema `pattern`, supported `format`, or explicit extractor | pick one extracted candidate | the candidate |
     | `float` with `ge=0` and `le=1` | yes or no | Jev's probability |
     | whole numbers 0, 1, 2, … with a description per level in the schema | score against a rubric | the nearest level |
     | `list` of a `Literal` or `Enum` | one yes or no per option | the options Jev said yes to |
@@ -178,6 +191,9 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     as context. An option is described by a description on its value in the schema, and by its name without one.
     A bare `bool`, `Literal` or `float` output has no field to describe, so there the agent's instructions are the
     question.
+    A string field is extraction only: its JSON Schema `pattern`, the built-in `email` or `uri` format extractor,
+    or an explicit [`TypeSafeTextExtractor`][pydantic_ai.models.typesafe.TypeSafeTextExtractor] supplies whole
+    candidates from the state. Jev picks one, with an explicit no-match option; it never writes or alters one.
     Confidence per field, from 0 for undecided to 1, is in
     [`ModelResponse.provider_details`][pydantic_ai.messages.ModelResponse.provider_details] under `confidence`,
     the full distribution of each pick-one and rubric field under `probabilities`, and each rubric field's
@@ -199,7 +215,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     Jev answers in one piece, so a streamed run gets the whole answer as one event rather than failing.
 
     Anything else Jev cannot do is refused with a [`UserError`][pydantic_ai.exceptions.UserError] before a
-    request is sent: text output, other field types, native tools, and files in the prompt or history.
+    request is sent: free text output, other field types, native tools, and files in the prompt or history.
 
     Sampling settings like `temperature` do not apply and are ignored. `timeout`, `extra_headers` and
     `extra_body` are forwarded.
@@ -209,6 +225,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
 
     _model_name: TypeSafeModelName = field(repr=False)
     _provider: Provider[AsyncTypeSafeClient] = field(repr=False)
+    _text_extractors: Mapping[str, TypeSafeTextExtractor] = field(repr=False)
 
     def __init__(
         self,
@@ -217,6 +234,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
         provider: Literal['typesafe'] | Provider[AsyncTypeSafeClient] = 'typesafe',
         profile: ModelProfileSpec | None = None,
         settings: ModelSettings | None = None,
+        text_extractors: Mapping[str, TypeSafeTextExtractor] | None = None,
     ):
         """Initialize a TypeSafe model.
 
@@ -226,12 +244,16 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
                 'typesafe' or an instance of `Provider[AsyncTypeSafeClient]`.
             profile: The model profile to use. Defaults to a profile picked by the provider based on the model name.
             settings: Model-specific settings that will be used as defaults for this model.
+            text_extractors: Candidate extractors for string output fields, keyed by field name. Use dotted names
+                such as `customer.email` for nested fields. A schema `pattern`, or the `email` or `uri` format,
+                supplies an extractor without this mapping. An explicit extractor takes precedence.
         """
         self._model_name = model_name
 
         if isinstance(provider, str):
             provider = infer_provider(provider)
         self._provider = provider
+        self._text_extractors = dict(text_extractors or {})
 
         super().__init__(settings=settings, profile=profile)
 
@@ -277,37 +299,51 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
         state = _map_messages(messages)
         instruction_parts = self._get_instruction_parts(messages, model_request_parameters) or []
         instructions = '\n\n'.join(part.content for part in instruction_parts) or None
-        questions = _questions(properties, output_tool, instructions) if output_tool else {}
+        questions, text_candidates = (
+            _questions(properties, output_tool, instructions, state, self._text_extractors) if output_tool else ({}, {})
+        )
         tool_key = _tool_question(questions, output_tool, tools, instructions)
         settings = cast(TypeSafeModelSettings, model_settings or {})
         threshold = settings.get('typesafe_tool_call_threshold', 0.6)
         if not 0 <= threshold <= 1:
             raise UserError(f'`typesafe_tool_call_threshold` must be between 0 and 1; got {threshold!r}.')
 
-        timeout = settings.get('timeout')
-        try:
-            response = await self.client.system_one(
-                state,
-                questions,
-                model=self._model_name,
-                timeout=None if timeout is None else to_httpx2_timeout(timeout),
-                extra_headers=settings.get('extra_headers'),
-                extra_body=cast('Mapping[str, JSONContent] | None', settings.get('extra_body')),
+        if questions:
+            timeout = settings.get('timeout')
+            try:
+                response = await self.client.system_one(
+                    state,
+                    questions,
+                    model=self._model_name,
+                    timeout=None if timeout is None else to_httpx2_timeout(timeout),
+                    extra_headers=settings.get('extra_headers'),
+                    extra_body=cast('Mapping[str, JSONContent] | None', settings.get('extra_body')),
+                )
+            except TypeSafeAPIResponseValidationError as e:
+                raise UnexpectedModelBehavior(f'Invalid response from TypeSafe: {e}', str(e.body)) from e
+            except TypeSafeAPIError as e:
+                raise ModelHTTPError(
+                    status_code=e.status, model_name=self._model_name, body=e.body, headers=dict(e.headers)
+                ) from e
+            except TypeSafeAPIConnectionError as e:
+                raise ModelAPIError(model_name=self._model_name, message=str(e)) from e
+            except TypeSafeError as e:
+                # What is left is the SDK refusing to send what it was given, such as an `extra_body` that will
+                # not encode as JSON. That is the caller's to fix, not the model's.
+                raise UserError(f'TypeSafe could not send this request: {e}') from e
+            answers = response.answers
+            response_usage = usage.RequestUsage(
+                input_tokens=response.usage.input_tokens or 0, output_tokens=response.usage.output_tokens or 0
             )
-        except TypeSafeAPIResponseValidationError as e:
-            raise UnexpectedModelBehavior(f'Invalid response from TypeSafe: {e}', str(e.body)) from e
-        except TypeSafeAPIError as e:
-            raise ModelHTTPError(
-                status_code=e.status, model_name=self._model_name, body=e.body, headers=dict(e.headers)
-            ) from e
-        except TypeSafeAPIConnectionError as e:
-            raise ModelAPIError(model_name=self._model_name, message=str(e)) from e
-        except TypeSafeError as e:
-            # What is left is the SDK refusing to send what it was given, such as an `extra_body` that will
-            # not encode as JSON. That is the caller's to fix, not the model's.
-            raise UserError(f'TypeSafe could not send this request: {e}') from e
+            response_model = response.model
+        else:
+            # Every optional string field had no candidates, so its deterministic answer is `None` and there is
+            # no question to send. This also keeps an absent value from becoming an invented one.
+            answers = {}
+            response_usage = usage.RequestUsage()
+            response_model = self._model_name
 
-        args, provider_details = _answers(response.answers, properties, questions)
+        args, provider_details = _answers(answers, properties, questions, text_candidates)
         parts: list[ModelResponsePart] = []
         if output_tool:
             parts.append(ToolCallPart(output_tool.name, args, _utils.generate_tool_call_id()))
@@ -326,10 +362,8 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
 
         return ModelResponse(
             parts=parts,
-            usage=usage.RequestUsage(
-                input_tokens=response.usage.input_tokens or 0, output_tokens=response.usage.output_tokens or 0
-            ),
-            model_name=response.model,
+            usage=response_usage,
+            model_name=response_model,
             provider_name=self._provider.name,
             provider_url=self._provider.base_url,
             provider_details=provider_details,
@@ -406,8 +440,18 @@ class TypeSafeStreamedResponse(StreamedResponse):
         return self._response.timestamp
 
 
+@dataclass(frozen=True)
+class _TextCandidates:
+    values: tuple[str, ...]
+    no_match: str
+    optional: bool
+
+
 def _answers(
-    answers: Mapping[str, object], properties: dict[str, dict[str, Any]], questions: dict[str, Noul | Choice | Score]
+    answers: Mapping[str, object],
+    properties: dict[str, dict[str, Any]],
+    questions: dict[str, Noul | Choice | Score],
+    text_candidates: Mapping[str, _TextCandidates],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The output's arguments and `provider_details` from Jev's answers to the field questions."""
     args: dict[str, Any] = {}
@@ -416,6 +460,35 @@ def _answers(
     scores: dict[str, float] = {}
     for name, prop in properties.items():
         prop, none_key = _optional(prop)
+        if extracted := text_candidates.get(name):
+            if not extracted.values:
+                _set(args, name, None)
+                confidence[name] = 1.0
+                probabilities[name] = {extracted.no_match: 1.0}
+                continue
+            answer = answers.get(name)
+            if not isinstance(answer, ChoiceAnswer):
+                raise UnexpectedModelBehavior(
+                    f'Unexpected answer from TypeSafe for extracted output field {name!r}: {answer!r}'
+                )
+            if answer.choice == extracted.no_match:
+                if not extracted.optional:
+                    raise UserError(
+                        f'TypeSafe found that none of the candidates extracted for required output field {name!r} '
+                        'fits. No value was invented.'
+                    )
+                value: str | None = None
+            elif answer.choice in extracted.values:
+                value = answer.choice
+            else:
+                raise UnexpectedModelBehavior(
+                    f'TypeSafe returned {answer.choice!r} for extracted output field {name!r}, but that value was '
+                    'not one of its candidates.'
+                )
+            _set(args, name, value)
+            confidence[name] = answer.confidence
+            probabilities[name] = answer.probabilities
+            continue
         if prop.get('type') == 'array':
             # One yes/no went out per option; the answer is the options that came back yes, in their order.
             labelled: dict[str, float] = {}
@@ -524,7 +597,7 @@ def _output_tools(
     if model_request_parameters.allow_text_output:
         raise UserError(
             'Text output is not supported by this model. Give the agent one structured `output_type`, '
-            'such as a `BaseModel`, without `str`, `NativeOutput` or `PromptedOutput`.'
+            'such as a `BaseModel`, without free text output, `NativeOutput` or `PromptedOutput`.'
         )
     with_fields: list[ToolDefinition] = []
     hand_offs: list[ToolDefinition] = []
@@ -599,10 +672,7 @@ def _optional(prop: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
         return prop, None
     inner = next(option for option in prop['anyOf'] if option != {'type': 'null'})
     prop = {**inner, **{k: v for k, v in prop.items() if k not in ('anyOf', 'default')}}
-    key = 'none'
-    while key in (_options(prop) or {}):
-        key += '_'
-    return prop, key
+    return prop, _no_match_key(_options(prop) or {})
 
 
 def _options(prop: dict[str, Any]) -> dict[Any, str | None] | None:
@@ -612,6 +682,154 @@ def _options(prop: dict[str, Any]) -> dict[Any, str | None] | None:
     if 'anyOf' in prop and all('const' in option for option in prop['anyOf']):
         return {option['const']: option.get('description') for option in prop['anyOf']}
     return None
+
+
+def _no_match_key(options: Iterable[object]) -> str:
+    key = 'none'
+    options = set(options)
+    while key in options:
+        key += '_'
+    return key
+
+
+@dataclass(frozen=True)
+class _RegexExtractor:
+    pattern: re.Pattern[str]
+
+    def __call__(self, state: JSONContent) -> Iterable[str]:
+        return (match.group() for text in _iter_strings(state) for match in self.pattern.finditer(text))
+
+
+def _iter_strings(value: object) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for nested in value.values():
+            yield from _iter_strings(nested)
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        for nested in value:
+            yield from _iter_strings(nested)
+
+
+def _extract_emails(state: JSONContent) -> Iterable[str]:
+    return _RegexExtractor(_EMAIL_PATTERN)(state)
+
+
+def _extract_uris(state: JSONContent) -> Iterable[str]:
+    return (match.group().rstrip('.,;!?') for text in _iter_strings(state) for match in _URI_PATTERN.finditer(text))
+
+
+_FORMAT_EXTRACTORS: Mapping[str, TypeSafeTextExtractor] = {'email': _extract_emails, 'uri': _extract_uris}
+
+
+def _schema_text_extractor(name: str, prop: dict[str, Any]) -> TypeSafeTextExtractor | None:
+    if (pattern := prop.get('pattern')) is not None:
+        if not isinstance(pattern, str):
+            raise UserError(f'Output field {name!r} has a non-string candidate extraction `pattern`.')
+        try:
+            return _RegexExtractor(re.compile(pattern))
+        except re.error as e:
+            raise UserError(f'Output field {name!r} has an invalid candidate extraction `pattern`: {e}.') from e
+    if (format_name := prop.get('format')) is not None:
+        if not isinstance(format_name, str):
+            raise UserError(f'Output field {name!r} has a non-string candidate extraction `format`.')
+        return _FORMAT_EXTRACTORS.get(format_name)
+    return None
+
+
+def _extract_text_candidates(name: str, extractor: TypeSafeTextExtractor, state: JSONContent) -> tuple[str, ...]:
+    try:
+        extracted = extractor(state)
+        if isinstance(extracted, str):
+            raise TypeError('an extractor must return an iterable of strings, not one string')
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for value in extracted:
+            if not isinstance(value, str):
+                raise TypeError(f'every candidate must be a string, not {type(value).__name__}')
+            if value and value not in seen:
+                candidates.append(value)
+                seen.add(value)
+    except Exception as e:
+        raise UserError(f'Text candidate extractor for output field {name!r} failed: {e}') from e
+    return tuple(candidates)
+
+
+def _validate_text_extractors(
+    properties: Mapping[str, object], text_extractors: Mapping[str, TypeSafeTextExtractor]
+) -> None:
+    if unknown := sorted(set(text_extractors) - properties.keys()):
+        raise UserError(f'Text candidate extractors refer to unknown output fields: {", ".join(unknown)}.')
+
+
+def _field_text_extractor(
+    name: str,
+    prop: dict[str, Any],
+    options: dict[Any, str | None] | None,
+    explicit: TypeSafeTextExtractor | None,
+) -> TypeSafeTextExtractor | None:
+    if explicit is not None:
+        if prop.get('type') != 'string' or options is not None:
+            raise UserError(
+                f'Text candidate extractor for output field {name!r} requires a plain string field, not another '
+                'field type or a finite set of options.'
+            )
+        return explicit
+    if prop.get('type') == 'string':
+        return _schema_text_extractor(name, prop)
+    return None
+
+
+def _optional_options(
+    name: str,
+    prop: dict[str, Any],
+    options: dict[Any, str | None] | None,
+    none_key: str | None,
+) -> dict[Any, str | None] | None:
+    if none_key is None:
+        return options
+    if options is None and prop.get('type') != 'string':
+        raise UserError(
+            f'Output field {name!r} is not supported by this model: only a `Literal` or `Enum` of strings can '
+            f'be optional, since `None` is one more option to pick. A string with a candidate extractor can '
+            f'also be optional. {_UNSUPPORTED_FIELD_HINT}'
+        )
+    if options is not None and not all(isinstance(option, str) for option in options):
+        raise UserError(
+            f'Output field {name!r} is not supported by this model: only a `Literal` or `Enum` of strings can '
+            f'be optional, since `None` is one more option to pick. {_UNSUPPORTED_FIELD_HINT}'
+        )
+    return {**options, none_key: 'None of these.'} if options is not None else None
+
+
+def _text_candidate_question(
+    name: str,
+    prop: dict[str, Any],
+    asked: JSONContent | None,
+    state: JSONContent,
+    extractor: TypeSafeTextExtractor | None,
+    *,
+    optional: bool,
+) -> tuple[Choice | None, _TextCandidates]:
+    if prop.get('type') != 'string' or extractor is None:
+        raise UserError(f'Output field {name!r} is not supported by this model. {_UNSUPPORTED_FIELD_HINT}')
+    candidates = _extract_text_candidates(name, extractor, state)
+    no_match = _no_match_key(candidates)
+    extracted = _TextCandidates(candidates, no_match, optional)
+    if not candidates:
+        if optional:
+            return None, extracted
+        raise UserError(
+            f'Text candidate extractor for required output field {name!r} found no candidates. No value was invented.'
+        )
+    if len(candidates) >= _MAX_CHOICE_OPTIONS:
+        raise UserError(
+            f'Text candidate extractor for output field {name!r} found {len(candidates)} candidates; Jev '
+            f'supports at most {_MAX_CHOICE_OPTIONS - 1} plus the no-match option.'
+        )
+    criteria: dict[str, str | None] = dict.fromkeys(candidates)
+    criteria[no_match] = 'None of these candidate values answers the field.'
+    return Choice(instructions=asked, criteria=criteria), extracted
 
 
 def _ask(
@@ -639,21 +857,21 @@ def _ask(
 
 
 def _questions(
-    properties: dict[str, dict[str, Any]], output_tool: ToolDefinition, instructions: str | None
-) -> dict[str, Noul | Choice | Score]:
+    properties: dict[str, dict[str, Any]],
+    output_tool: ToolDefinition,
+    instructions: str | None,
+    state: JSONContent,
+    text_extractors: Mapping[str, TypeSafeTextExtractor],
+) -> tuple[dict[str, Noul | Choice | Score], dict[str, _TextCandidates]]:
     """One Jev question per output field."""
+    _validate_text_extractors(properties, text_extractors)
     questions: dict[str, Noul | Choice | Score] = {}
+    extracted_fields: dict[str, _TextCandidates] = {}
     for name, prop in properties.items():
         ask = _ask(name, prop, output_tool, instructions)
         prop, none_key = _optional(prop)
-        options = _options(prop)
-        if none_key is not None:
-            if options is None or not all(isinstance(option, str) for option in options):
-                raise UserError(
-                    f'Output field {name!r} is not supported by this model: only a `Literal` or `Enum` of strings can '
-                    f'be optional, since `None` is one more option to pick. {_UNSUPPORTED_FIELD_HINT}'
-                )
-            options = {**options, none_key: 'None of these.'}
+        options = _optional_options(name, prop, _options(prop), none_key)
+        extractor = _field_text_extractor(name, prop, options, text_extractors.get(name))
 
         # A single value needs no labelling, and TypeSafe's advice is to start with a string; the object
         # form earns its keys only once there is more than one thing in it.
@@ -696,8 +914,13 @@ def _questions(
                 )
             questions[name] = Noul(instructions=asked)
         else:
-            raise UserError(f'Output field {name!r} is not supported by this model. {_UNSUPPORTED_FIELD_HINT}')
-    return questions
+            question, extracted = _text_candidate_question(
+                name, prop, asked, state, extractor, optional=none_key is not None
+            )
+            extracted_fields[name] = extracted
+            if question is not None:
+                questions[name] = question
+    return questions, extracted_fields
 
 
 def _described(output_tool: ToolDefinition) -> str | None:
