@@ -279,7 +279,11 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             for tool in model_request_parameters.function_tools
             if model_request_parameters.visibility_of(tool.name) != 'withheld'
         ]
-        tools = _tools_left(messages, [*hand_offs, *function_tools])
+        offered = [*hand_offs, *function_tools]
+        tools = _tools_left(messages, offered)
+        if not output_tools and len(tools) == 1 and len(offered) > 1:
+            # Every other route has returned this turn, so the one left is taken without a question.
+            return self._forced(tools[0])
         state = _map_messages(messages)
         instruction_parts = self._get_instruction_parts(messages, model_request_parameters) or []
         instructions = '\n\n'.join(part.content for part in instruction_parts) or None
@@ -313,7 +317,13 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             parts.append(ToolCallPart(output_tool.name, args, _utils.generate_tool_call_id()))
         if tool_key is not None:
             picked = _tool_call(
-                self._model_name, response.answers.get(tool_key), output_tools, tools, threshold, provider_details
+                self._model_name,
+                response.answers.get(tool_key),
+                output_tools,
+                tools,
+                {tool.name for tool in hand_offs},
+                threshold,
+                provider_details,
             )
             if isinstance(picked, ToolCallPart):
                 parts = [picked]
@@ -368,6 +378,21 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             # not encode as JSON. That is the caller's to fix, not the model's.
             raise UserError(f'TypeSafe could not send this request: {e}') from e
 
+    def _forced(self, tool: ToolDefinition) -> ModelResponse:
+        """The response when one route is left and there is nothing to fill: that route, without asking Jev."""
+        details = {'tool': {'choice': tool.name, 'probabilities': {tool.name: 1.0}, 'offered': [tool.name]}}
+        if tool.parameters_json_schema.get('properties'):
+            raise ToolCallProposed(self._model_name, tool.name, 1.0)
+        return ModelResponse(
+            parts=[ToolCallPart(tool.name, {}, _utils.generate_tool_call_id())],
+            usage=usage.RequestUsage(),
+            model_name=self._model_name,
+            provider_name=self._provider.name,
+            provider_url=self._provider.base_url,
+            provider_details=details,
+            finish_reason='tool_call',
+        )
+
     @asynccontextmanager
     async def request_stream(
         self,
@@ -391,6 +416,9 @@ class TypeSafeStreamedResponse(StreamedResponse):
         self._usage = self._response.usage
         self.provider_details = self._response.provider_details
         self.finish_reason = self._response.finish_reason
+
+    async def close_stream(self) -> None:
+        """No live stream to close: the whole answer was in hand before the first event."""
 
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
         for i, part in enumerate(self._response.parts):
@@ -486,37 +514,56 @@ def _tool_call(
     answer: object,
     output_tools: list[ToolDefinition],
     tools: list[ToolDefinition],
+    hand_offs: set[str],
     threshold: float,
     provider_details: dict[str, Any],
 ) -> ToolDefinition | ToolCallPart:
     """The output or tool call Jev takes from its answer to the tool question.
 
     An output pick is always taken because it selects what Jev should fill, rather than proposing an external action.
-    A non-output tool below the threshold is a lean: the most probable output member is filled, which preserves the
-    single-output behavior when a union has no one default. With nothing to fill, the pick is necessarily the answer.
-    A tool taken that needs arguments is raised as `ToolCallProposed` for a model behind Jev.
+    A non-output tool below the threshold is a lean: the most probable structured output member is filled, or with
+    none to fill, the likeliest output function is taken instead. A tool taken that needs arguments is raised as
+    `ToolCallProposed` for a model behind Jev.
     """
-    if not isinstance(answer, ChoiceAnswer) or answer.choice not in answer.probabilities:
+    if (
+        not isinstance(answer, ChoiceAnswer)
+        or answer.choice not in answer.probabilities
+        or not all(0 <= p <= 1 for p in answer.probabilities.values())
+    ):
         raise UnexpectedModelBehavior(f'Unexpected answer from TypeSafe for the tool question: {answer!r}')
     probability = answer.probabilities[answer.choice]
-    # The pick and its probabilities are reported either way, so the hand-off rate can be watched.
-    provider_details['tool'] = {'choice': answer.choice, 'probabilities': answer.probabilities}
+    # The pick, its probabilities and what was on offer are reported either way, so the hand-off rate can be
+    # watched, and a tool that was withheld this turn can be seen to have been.
+    provider_details['tool'] = {
+        'choice': answer.choice,
+        'probabilities': answer.probabilities,
+        'offered': [tool.name for tool in tools],
+    }
     if output_tool := next((tool for tool in output_tools if tool.name == answer.choice), None):
         return output_tool
-    if output_tools and probability < threshold:
-        candidates = [
-            (answer.probabilities[tool.name], tool) for tool in output_tools if tool.name in answer.probabilities
-        ]
-        if not candidates:
-            raise UnexpectedModelBehavior('TypeSafe did not return a probability for any offered output type')
-        return max(candidates, key=lambda candidate: candidate[0])[1]
     tool = next((tool for tool in tools if tool.name == answer.choice), None)
     if tool is None:
         raise UnexpectedModelBehavior(f'TypeSafe picked a tool it was not offered: {answer.choice!r}')
+    if tool.name not in hand_offs and probability < threshold:
+        if output_tools:
+            candidates = [
+                (answer.probabilities[tool.name], tool) for tool in output_tools if tool.name in answer.probabilities
+            ]
+            if not candidates:
+                raise UnexpectedModelBehavior('TypeSafe did not return a probability for any offered output type')
+            return max(candidates, key=lambda candidate: candidate[0])[1]
+        likeliest = max(
+            (candidate for candidate in tools if candidate.name in hand_offs),
+            key=lambda candidate: answer.probabilities.get(candidate.name, 0.0),
+            default=None,
+        )
+        if likeliest is not None:
+            provider_details['tool']['taken'] = likeliest.name
+            tool = likeliest
     if tool.parameters_json_schema.get('properties'):
-        raise ToolCallProposed(model_name, answer.choice, probability)
-    # Nothing to write, so Jev makes the call itself.
-    return ToolCallPart(answer.choice, {}, _utils.generate_tool_call_id())
+        raise ToolCallProposed(model_name, tool.name, probability)
+    # Nothing to write, so the call is made on Jev's pick.
+    return ToolCallPart(tool.name, {}, _utils.generate_tool_call_id())
 
 
 def _output_tools(
@@ -723,27 +770,27 @@ def _questions(
 
 
 def _tools_left(messages: list[ModelMessage], tools: list[ToolDefinition]) -> list[ToolDefinition]:
-    """The tools still on offer: one with no arguments is offered once per turn.
+    """The tools still on offer: one whose result is already in the turn is not offered again.
 
     Jev has no notion of having made a call. With a call and its result in view, the text still calls for the
-    tool, so left on offer it is picked again until the usage limit. A tool with arguments stays, because the
-    model that makes that call can vary them. The turn is everything since the last user prompt: a call in an
-    earlier turn, or in another agent's run being judged, does not withhold the tool from this one.
+    tool, so left on offer it is picked again until the usage limit; that goes for a tool a model behind Jev
+    called too, since Jev would propose it again on the same text. A call that produced no result, because the
+    tool asked for a retry, leaves the tool on offer. The turn is everything since the last user prompt, which
+    is the nearest thing to a run boundary the history has: a result from an earlier turn does not withhold the
+    tool, but a judged history that ends in another agent's call to a tool of the same name does.
     """
-    prompts = [
-        index
-        for index, message in enumerate(messages)
-        if isinstance(message, ModelRequest) and any(isinstance(part, UserPromptPart) for part in message.parts)
-    ]
-    turn = messages[prompts[-1] :] if prompts else messages
-    called = {
-        part.tool_name
-        for message in turn
-        if isinstance(message, ModelResponse)
-        for part in message.parts
-        if isinstance(part, ToolCallPart)
-    }
-    return [tool for tool in tools if tool.parameters_json_schema.get('properties') or tool.name not in called]
+    returned: set[str] = set()
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, UserPromptPart):
+                # A new prompt starts a turn, and a result that arrived before it in the same request is the
+                # previous turn's.
+                returned.clear()
+            elif isinstance(part, ToolReturnPart):
+                returned.add(part.tool_name)
+    return [tool for tool in tools if tool.name not in returned]
 
 
 def _tool_question(
