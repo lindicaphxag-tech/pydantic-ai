@@ -117,7 +117,7 @@ Each field of the output type is a question, and all of them go out in a single 
 |---|---|---|
 | `bool` | yes or no | `True` when Jev's probability is at least 0.5 |
 | `Literal[...]` or `Enum` of strings | pick one | the chosen option |
-| `str` with a schema `pattern`, supported `format`, or explicit extractor | pick one candidate extracted from the state | the candidate |
+| `str` with a supported `format` or an explicit extractor | pick one candidate extracted from the state | the candidate |
 | `float` with `ge=0` and `le=1` | yes or no | Jev's probability |
 | `list` of a `Literal` or `Enum` | one yes or no per option | the options Jev said yes to |
 | a nested model of these | its fields, asked as `outer.inner` | the model |
@@ -133,9 +133,10 @@ A `list` of options is TypeSafe's fan-out: one yes/no per option, all in the sam
 
 Jev cannot write text, but it can pick one string that was already present. A plain `str` field is answerable only when Pydantic AI can extract its candidates deterministically before the request:
 
-- A JSON Schema `pattern` is compiled as a Python regular expression, and every complete match is a candidate.
 - The JSON Schema formats `email` and `uri` use built-in extractors. These are the two formats Pydantic AI tests; another format does not imply extraction support.
-- An explicit [`TypeSafeTextExtractor`][pydantic_ai.models.typesafe.TypeSafeTextExtractor] returns candidates for one field. Pass these to [`TypeSafeModel`][pydantic_ai.models.typesafe.TypeSafeModel] as `text_extractors`, keyed by field name; use the flattened name such as `customer.email` for a nested field. An explicit extractor takes precedence over `pattern` or `format`, though its selected value must still pass the field's Pydantic validation.
+- An explicit [`TypeSafeTextExtractor`][pydantic_ai.models.typesafe.TypeSafeTextExtractor] returns candidates for one field. Pass these to [`TypeSafeModel`][pydantic_ai.models.typesafe.TypeSafeModel] as `text_extractors`, keyed by field name; use the flattened name such as `customer.email` for a nested field. An explicit extractor takes precedence over a `format`, though its selected value must still pass the field's Pydantic validation.
+
+A field's schema `pattern` is deliberately not used as an extractor. Running one would mean matching a regular expression Pydantic AI did not write against text it did not write, and a pattern that looks harmless can backtrack for exponential time on an input chosen to make it, holding the interpreter while it does. An extractor you pass is your own code, like a tool function.
 
 Extractors receive the state Jev judges: a string when the latest prompt stands alone, or the JSON-compatible mapping containing `history` and `text` described under [judging a conversation](#judging-a-conversation). They are synchronous and must return an iterable of strings. Candidates from every source are de-duplicated in first-seen order. At most 254 candidates are accepted because the required no-match option is the 255th option Jev supports.
 
@@ -154,7 +155,7 @@ EmailText = Annotated[str, WithJsonSchema({'type': 'string', 'format': 'email'})
 
 class InvoiceDetails(BaseModel):
     customer_email: EmailText = Field(description="Which email address belongs to the customer?")
-    open_case: str = Field(pattern=r'CASE-\d{4}', description='Which case is still open?')
+    open_case: str = Field(description='Which case is still open?')
     overcharge: str = Field(description='Which amount is the overcharge?')
 
 
@@ -162,7 +163,13 @@ def amounts(state: object) -> list[str]:
     return re.findall(r'\$\d+\.\d{2}', json.dumps(state))
 
 
-model = TypeSafeModel('jev-latest', text_extractors={'overcharge': amounts})
+def cases(state: object) -> list[str]:
+    return re.findall(r'CASE-\d{4}', json.dumps(state))
+
+
+model = TypeSafeModel(
+    'jev-latest', text_extractors={'overcharge': amounts, 'open_case': cases}
+)
 agent = Agent(model, output_type=InvoiceDetails)
 result = agent.run_sync(
     'Customer mira@example.com says CASE-1042 is closed and CASE-2048 is open. '
@@ -174,7 +181,7 @@ print(result.output)
 
 Every extraction question includes an explicit "none of these candidate values" option. For a required field, finding no candidates before the request or having Jev pick that option raises a [`UserError`][pydantic_ai.exceptions.UserError]. For `str | None`, either case returns `None`; when no other question needs Jev, no request is made. A candidate outside the extracted set is never accepted.
 
-This is selection, not generation. A pattern or extractor cannot make Jev summarise the material, compose a reply, normalise a value, or copy arbitrary text that was not offered as one whole candidate. A `str` field without an available extractor remains unsupported.
+This is selection, not generation. An extractor cannot make Jev summarise the material, compose a reply, normalise a value, or copy arbitrary text that was not offered as one whole candidate. A `str` field without an available extractor remains unsupported.
 
 Confidence in each answer is on the response, in `provider_details['confidence']`: 0 to 1, one number per field, so one threshold reads the same way across an output type. It is a margin, not a probability that the answer is right. For a yes/no it is how far Jev's probability sits from the coin flip, doubled — a `False` answered from a probability of 0.01 reports 0.98, one answered from 0.45 reports 0.10. For a pick-one it is Jev's own number, from how its probabilities are spread; for a list of options it is the least sure option's. `provider_details['probabilities']` holds the whole distribution of each pick-one field, and each option's probability for a list.
 

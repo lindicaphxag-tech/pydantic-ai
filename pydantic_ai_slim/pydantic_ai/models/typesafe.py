@@ -723,13 +723,14 @@ _FORMAT_EXTRACTORS: Mapping[str, TypeSafeTextExtractor] = {'email': _extract_ema
 
 
 def _schema_text_extractor(name: str, prop: dict[str, Any]) -> TypeSafeTextExtractor | None:
-    if (pattern := prop.get('pattern')) is not None:
-        if not isinstance(pattern, str):
-            raise UserError(f'Output field {name!r} has a non-string candidate extraction `pattern`.')
-        try:
-            return _RegexExtractor(re.compile(pattern))
-        except re.error as e:
-            raise UserError(f'Output field {name!r} has an invalid candidate extraction `pattern`: {e}.') from e
+    """The extractor a field's own schema implies, which is only ever one this module wrote.
+
+    A `pattern` is deliberately not used. Running it would mean matching a regular expression we did not
+    write against text we did not write: an innocent-looking pattern such as `(a+)+$` backtracks for
+    exponential time on an input chosen to make it, and since a regex holds the GIL, that blocks the event
+    loop and no timeout applies. An explicit extractor is the caller's own code and carries its own risk,
+    as a tool function does; a `pattern` in a schema does not read like code that is about to run.
+    """
     if (format_name := prop.get('format')) is not None:
         if not isinstance(format_name, str):
             raise UserError(f'Output field {name!r} has a non-string candidate extraction `format`.')
@@ -750,6 +751,10 @@ def _extract_text_candidates(name: str, extractor: TypeSafeTextExtractor, state:
             if value and value not in seen:
                 candidates.append(value)
                 seen.add(value)
+                if len(candidates) >= _MAX_CHOICE_OPTIONS:
+                    # One past the limit already makes the question invalid, and an extractor may be
+                    # generating without end, so nothing is gained by reading the rest of it.
+                    break
     except Exception as e:
         raise UserError(f'Text candidate extractor for output field {name!r} failed: {e}') from e
     return tuple(candidates)

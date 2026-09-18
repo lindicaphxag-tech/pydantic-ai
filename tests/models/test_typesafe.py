@@ -106,7 +106,7 @@ class ExtractedDetails(BaseModel):
     """Extract details from a support ticket without writing new text."""
 
     customer_email: EmailText = Field(description='Which email address belongs to the customer?')
-    open_case: str = Field(pattern=r'CASE-\d{4}', description='Which case is still open?')
+    open_case: str = Field(description='Which case is still open?')
     account_page: UriText = Field(description="Which URI is the customer's account page?")
     overcharge: str = Field(description='Which amount is the overcharge?')
 
@@ -114,6 +114,11 @@ class ExtractedDetails(BaseModel):
 def extract_amounts(state: JSONContent) -> list[str]:
     assert isinstance(state, str)
     return re.findall(r'\$\d+\.\d{2}', state)
+
+
+def extract_cases(state: JSONContent) -> list[str]:
+    assert isinstance(state, str)
+    return re.findall(r'CASE-\d+', state)
 
 
 def rubric(*levels: tuple[int, str]) -> WithJsonSchema:
@@ -289,9 +294,13 @@ async def test_text_candidate_output(
     typesafe_api_key: str,
     request_capture: RequestCapture,
 ):
-    """Patterns, supported formats and a model-level extractor all become bounded Choice questions."""
+    """Supported formats and model-level extractors all become bounded Choice questions."""
     provider = TypeSafeProvider(api_key=typesafe_api_key, http_client=request_capture.client)
-    model = TypeSafeModel('jev-latest', provider=provider, text_extractors={'overcharge': extract_amounts})
+    model = TypeSafeModel(
+        'jev-latest',
+        provider=provider,
+        text_extractors={'overcharge': extract_amounts, 'open_case': extract_cases},
+    )
     agent = Agent(model, output_type=ExtractedDetails)
     result = await agent.run(
         'Customer Mira uses mira@example.com; the agent uses lee@example.org. '
@@ -619,7 +628,7 @@ async def test_an_explicit_extractor_overrides_the_schema_and_deduplicates_candi
     seen: list[dict[str, Any]] = []
 
     class Selected(BaseModel):
-        identifier: str = Field(pattern=r'[AB]-\d+', description='Which identifier?')
+        identifier: str = Field(description='Which identifier?')
 
     def record(request: httpx2.Request) -> httpx2.Response:
         seen.append(json.loads(request.content))
@@ -668,12 +677,13 @@ async def test_an_explicit_extractor_uses_the_flattened_name_of_a_nested_field(a
 
 async def test_no_candidates_answers_none_for_an_optional_field_without_a_request(allow_model_requests: None):
     class Selected(BaseModel):
-        identifier: str | None = Field(pattern=r'CASE-\d+', description='Which case, if any?')
+        identifier: str | None = Field(default=None, description='Which case, if any?')
 
     def unreachable(request: httpx2.Request) -> httpx2.Response:  # pragma: no cover
         raise AssertionError('the request should not be sent')
 
-    result = await Agent(mock_model(unreachable), output_type=Selected).run('No case number was supplied.')
+    model = mock_model(unreachable, text_extractors={'identifier': extract_cases})
+    result = await Agent(model, output_type=Selected).run('No case number was supplied.')
     assert result.output.identifier is None
     assert result.response.usage == RequestUsage()
     assert result.response.provider_details == snapshot(
@@ -693,7 +703,7 @@ async def test_the_no_match_option_never_becomes_an_invented_value(allow_model_r
         (BaseModel,),
         {
             '__annotations__': {'identifier': annotation},
-            'identifier': Field(pattern=r'CASE-\d+', description='Which case is open?'),
+            'identifier': Field(description='Which case is open?'),
         },
     )
     model = mock_model(
@@ -704,7 +714,8 @@ async def test_the_no_match_option_never_becomes_an_invented_value(allow_model_r
                 'confidence': 0.8,
                 'probabilities': {'CASE-1000': 0.2, 'none': 0.8},
             }
-        )
+        ),
+        text_extractors={'identifier': extract_cases},
     )
     agent = Agent(model, output_type=Selected)
     if optional:
@@ -782,8 +793,6 @@ async def test_invalid_extractor_configuration_is_refused(
 @pytest.mark.parametrize(
     'schema,match',
     [
-        pytest.param({'type': 'string', 'pattern': '['}, 'invalid candidate extraction `pattern`', id='pattern'),
-        pytest.param({'type': 'string', 'pattern': 1}, 'non-string candidate extraction `pattern`', id='pattern type'),
         pytest.param({'type': 'string', 'format': 1}, 'non-string candidate extraction `format`', id='format type'),
         pytest.param({'type': 'string', 'format': 'uuid'}, 'is not supported by this model', id='unknown format'),
     ],
@@ -826,10 +835,11 @@ async def test_an_unexpected_extracted_answer(
     match: str,
 ):
     class Selected(BaseModel):
-        identifier: str = Field(pattern=r'CASE-\d+', description='Which case?')
+        identifier: str = Field(description='Which case?')
 
+    model = mock_model(lambda _: answers(identifier=answer), text_extractors={'identifier': extract_cases})
     with pytest.raises(UnexpectedModelBehavior, match=match):
-        await Agent(mock_model(lambda _: answers(identifier=answer)), output_type=Selected).run('CASE-1000')
+        await Agent(model, output_type=Selected).run('CASE-1000')
 
 
 async def test_rubric_levels_are_read_in_level_order(allow_model_requests: None):
