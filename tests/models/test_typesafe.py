@@ -1683,6 +1683,81 @@ async def test_direct_request_without_prompt(allow_model_requests: None):
     }
 
 
+async def test_a_returned_output_handoff_can_leave_one_argument_tool(allow_model_requests: None):
+    """Supplied history can leave an argument-taking function as the one route that remains."""
+    request = Mock()
+    output_tool = ToolDefinition(name='final_result', description='Finish.', kind='output')
+    function_tool = ToolDefinition(
+        name='refund',
+        description='Refund a payment.',
+        parameters_json_schema={
+            'type': 'object',
+            'properties': {'amount': {'type': 'integer'}},
+            'required': ['amount'],
+        },
+    )
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart('Charged twice.')]),
+        ModelResponse(parts=[ToolCallPart('final_result', {}, 'call_1')]),
+        ModelRequest(parts=[ToolReturnPart('final_result', 'Returned.', 'call_1')]),
+    ]
+
+    with pytest.raises(ToolCallProposed, match="Jev proposed calling 'refund'"):
+        await model_request(
+            mock_model(request),
+            messages,
+            model_request_parameters=ModelRequestParameters(
+                output_mode='tool',
+                output_tools=[output_tool],
+                function_tools=[function_tool],
+                allow_text_output=False,
+            ),
+        )
+    request.assert_not_called()
+
+
+async def test_a_low_pick_stands_when_no_output_handoff_remains(allow_model_requests: None):
+    """With only ordinary no-argument tools left, there is no output hand-off for a low pick to fall through to."""
+    output_tool = ToolDefinition(name='final_result', description='Finish.', kind='output')
+    function_tools = [
+        ToolDefinition(name='archive', description='Archive it.'),
+        ToolDefinition(name='notify', description='Notify someone.'),
+    ]
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart('Archive this.')]),
+        ModelResponse(parts=[ToolCallPart('final_result', {}, 'call_1')]),
+        ModelRequest(parts=[ToolReturnPart('final_result', 'Returned.', 'call_1')]),
+    ]
+    response = await model_request(
+        mock_model(
+            lambda _: answers(
+                tool={
+                    'type': 'choice',
+                    'choice': 'archive',
+                    'confidence': 0.1,
+                    'probabilities': {'archive': 0.4, 'notify': 0.35},
+                }
+            )
+        ),
+        messages,
+        model_request_parameters=ModelRequestParameters(
+            output_mode='tool',
+            output_tools=[output_tool],
+            function_tools=function_tools,
+            allow_text_output=False,
+        ),
+    )
+
+    assert response.parts == [ToolCallPart('archive', {}, response.parts[0].tool_call_id)]
+    assert (response.provider_details or {})['tool'] == snapshot(
+        {
+            'choice': 'archive',
+            'probabilities': {'archive': 0.4, 'notify': 0.35},
+            'offered': ['archive', 'notify'],
+        }
+    )
+
+
 async def test_streaming_gives_the_whole_answer_as_one_event(allow_model_requests: None):
     """Jev answers in one piece, so a streamed run gets the answer as a single event rather than failing."""
     jev = mock_model(lambda _: answers(response={'type': 'noul', 'noul': 0.9}))
