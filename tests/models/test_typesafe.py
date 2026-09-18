@@ -5,6 +5,7 @@ import pickle
 from collections.abc import Callable
 from enum import Enum, IntEnum
 from typing import Any, Literal, cast
+from unittest.mock import Mock
 
 import httpx2
 import pytest
@@ -32,10 +33,12 @@ from pydantic_ai import (
     TextPart,
     ThinkingPart,
     ToolCallPart,
+    ToolOutput,
     ToolReturnPart,
     UserPromptPart,
     WebSearchTool,
 )
+from pydantic_ai._output import DEFAULT_OUTPUT_TOOL_DESCRIPTION
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.direct import model_request
 from pydantic_ai.exceptions import ModelRetry, UnexpectedModelBehavior, UserError
@@ -516,6 +519,10 @@ class Escalation(BaseModel):
     team: Literal['billing', 'technical'] = Field(description='Which team should take this?')
 
 
+class UndescribedDecision(BaseModel):
+    accepted: bool
+
+
 def refund(amount: float) -> str:
     """Return a payment to the customer."""
     return f'Refunded {amount}'
@@ -636,17 +643,29 @@ async def test_union_members_are_described_by_their_docstring_or_instructions(al
     )
 
 
-async def test_an_undescribed_union_member_is_refused_before_the_choice_call(allow_model_requests: None):
-    requests = 0
+async def test_a_single_custom_description_that_looks_generated_is_preserved(allow_model_requests: None):
+    """Only the titled stock descriptions generated for multiple outputs are discarded."""
+    seen: list[dict[str, Any]] = []
 
-    def unreachable(request: httpx2.Request) -> httpx2.Response:
-        nonlocal requests
-        requests += 1
-        raise AssertionError('the request should never be sent')
+    def record(request: httpx2.Request) -> httpx2.Response:
+        seen.append(json.loads(request.content))
+        return answers(accepted={'type': 'noul', 'noul': 0.9})
+
+    description = f'UndescribedDecision: {DEFAULT_OUTPUT_TOOL_DESCRIPTION}'
+    result = await Agent(mock_model(record), output_type=ToolOutput(UndescribedDecision, description=description)).run(
+        'anything'
+    )
+
+    assert result.output == UndescribedDecision(accepted=True)
+    assert seen[0]['questions']['accepted']['instructions'] == snapshot({'field': 'accepted', 'goal': description})
+
+
+async def test_an_undescribed_union_member_is_refused_before_the_choice_call(allow_model_requests: None):
+    unreachable = Mock()
 
     with pytest.raises(UserError, match='Give the output type a docstring'):
         await Agent(mock_model(unreachable), output_type=Ticket | Undescribed).run('anything')
-    assert requests == 0
+    unreachable.assert_not_called()
 
 
 @pytest.mark.vcr
@@ -782,16 +801,11 @@ async def test_a_union_tool_lean_without_output_probabilities_is_unexpected(allo
 
 async def test_an_unexpressible_union_member_fails_before_the_choice_call(allow_model_requests: None):
     """Every member is validated first, so an invalid union never spends a call or silently falls back."""
-    requests = 0
-
-    def unreachable(request: httpx2.Request) -> httpx2.Response:
-        nonlocal requests
-        requests += 1
-        raise AssertionError('the request should never be sent')
+    unreachable = Mock()
 
     with pytest.raises(UserError, match="Output field 'summary' is not supported"):
         await Agent(mock_model(unreachable), output_type=Ticket | WithText).run('anything')
-    assert requests == 0
+    unreachable.assert_not_called()
 
 
 @pytest.mark.vcr

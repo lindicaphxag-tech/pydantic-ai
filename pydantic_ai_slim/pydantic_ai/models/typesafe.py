@@ -139,6 +139,13 @@ class ToolCallProposed(ModelAPIError):
         return self.__class__, (self.model_name, self.tool_name, self.probability)
 
 
+@dataclass(frozen=True)
+class _Output:
+    tool: ToolDefinition
+    properties: dict[str, dict[str, Any]]
+    questions: dict[str, Noul | Choice | Score]
+
+
 @dataclass(init=False)
 class TypeSafeModel(Model[AsyncTypeSafeClient]):
     """A model that fills a structured `output_type` with one or two requests to a TypeSafe Jev model.
@@ -283,15 +290,20 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
 
         # Build every member's questions before the first request. An output Jev cannot express is a coding error,
         # not a reason to spend one choice call before failing or to route every request to a fallback model.
-        outputs = {
-            tool.name: (tool, properties, _questions(properties, tool, instructions))
-            for tool in output_tools
-            for properties in [_fields(tool)]
-        }
+        multiple_outputs = len(model_request_parameters.output_tools) > 1
+        outputs: dict[str, _Output] = {}
+        for tool in output_tools:
+            output_properties = _fields(tool)
+            outputs[tool.name] = _Output(
+                tool,
+                output_properties,
+                _questions(output_properties, tool, instructions, multiple_outputs=multiple_outputs),
+            )
         output_tool = output_tools[0] if len(output_tools) == 1 else None
-        properties = outputs[output_tool.name][1] if output_tool else {}
-        questions = outputs[output_tool.name][2] if output_tool else {}
-        tool_key = _tool_question(questions, output_tools, tools, instructions)
+        output = outputs[output_tool.name] if output_tool else None
+        properties = output.properties if output else {}
+        questions = output.questions if output else {}
+        tool_key = _tool_question(questions, output_tools, tools, instructions, multiple_outputs=multiple_outputs)
 
         response = await self._system_one(state, questions, settings)
         response_usage = _request_usage(response)
@@ -306,7 +318,10 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             if isinstance(picked, ToolCallPart):
                 parts = [picked]
             elif picked is not output_tool:
-                output_tool, properties, questions = outputs[picked.name]
+                output = outputs[picked.name]
+                output_tool = output.tool
+                properties = output.properties
+                questions = output.questions
                 response = await self._system_one(state, questions, settings)
                 response_usage += _request_usage(response)
                 args, field_details = _answers(response.answers, properties, questions)
@@ -601,19 +616,24 @@ def _options(prop: dict[str, Any]) -> dict[Any, str | None] | None:
     return None
 
 
-def _output_description(output_tool: ToolDefinition) -> str | None:
+def _output_description(output_tool: ToolDefinition, *, multiple_outputs: bool) -> str | None:
     """The output description the user wrote, without either generated stock form."""
     description = output_tool.description
     if not description or description == DEFAULT_OUTPUT_TOOL_DESCRIPTION:
         return None
     title = output_tool.parameters_json_schema.get('title')
-    if title and description == f'{title}: {DEFAULT_OUTPUT_TOOL_DESCRIPTION}':
+    if multiple_outputs and title and description == f'{title}: {DEFAULT_OUTPUT_TOOL_DESCRIPTION}':
         return None
     return description
 
 
 def _ask(
-    name: str, prop: dict[str, Any], output_tool: ToolDefinition, instructions: str | None
+    name: str,
+    prop: dict[str, Any],
+    output_tool: ToolDefinition,
+    instructions: str | None,
+    *,
+    multiple_outputs: bool,
 ) -> dict[str, JSONContent]:
     """What a field asks, as the labelled parts TypeSafe's own examples use."""
     # Only what the user wrote goes to Jev. A bare `bool` output is wrapped in a field named `response`
@@ -626,7 +646,7 @@ def _ask(
         ask['field'] = name
     if description := prop.get('description'):
         ask['question'] = description
-    if description := _output_description(output_tool):
+    if description := _output_description(output_tool, multiple_outputs=multiple_outputs):
         ask['goal'] = description
     if instructions:
         # With no field to describe, a bare output's whole question is what the agent was instructed to
@@ -637,12 +657,16 @@ def _ask(
 
 
 def _questions(
-    properties: dict[str, dict[str, Any]], output_tool: ToolDefinition, instructions: str | None
+    properties: dict[str, dict[str, Any]],
+    output_tool: ToolDefinition,
+    instructions: str | None,
+    *,
+    multiple_outputs: bool,
 ) -> dict[str, Noul | Choice | Score]:
     """One Jev question per output field."""
     questions: dict[str, Noul | Choice | Score] = {}
     for name, prop in properties.items():
-        ask = _ask(name, prop, output_tool, instructions)
+        ask = _ask(name, prop, output_tool, instructions, multiple_outputs=multiple_outputs)
         prop, none_key = _optional(prop)
         options = _options(prop)
         if none_key is not None:
@@ -727,6 +751,8 @@ def _tool_question(
     output_tools: list[ToolDefinition],
     tools: list[ToolDefinition],
     instructions: str | None,
+    *,
+    multiple_outputs: bool,
 ) -> str | None:
     """With alternatives attached, one more question: which tool the text calls for, output tools among them.
 
@@ -749,7 +775,7 @@ def _tool_question(
         key += '_'
     criteria: dict[str, str | None] = {}
     for output_tool in output_tools:
-        described = _output_description(output_tool)
+        described = _output_description(output_tool, multiple_outputs=multiple_outputs)
         if not (described or instructions):
             raise UserError(
                 'With alternatives attached, Jev weighs filling the output type against the others by what each is '
