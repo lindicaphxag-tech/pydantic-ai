@@ -112,7 +112,7 @@ Agent('typesafe:jev-1.13.0', output_type=Ticket)
 
 ## What Jev can answer
 
-Every field of the output type is one question, and all of them go out in a single request:
+Every field of one structured output type is one question, and all of them go out in a single request:
 
 | Field type | Question | Answer |
 |---|---|---|
@@ -123,6 +123,7 @@ Every field of the output type is one question, and all of them go out in a sing
 | `list` of a `Literal` or `Enum` | one yes or no per option | the options Jev said yes to |
 | a nested model of these | its fields, asked as `outer.inner` | the model |
 | `Literal[...]` or `Enum`, or `None` | pick one, or none of these | the option, or `None` |
+| a union of structured types | pick the type, then ask its fields | the chosen type |
 
 The field description is the question text; an `Enum` field without one uses the enum's class docstring. The output type's docstring and the agent's instructions are context, so put the framing there and the per-field wording in the descriptions — see [where the question goes](#where-the-question-goes). A docstring under an `Enum` member, as in the example above, describes that option. A `Literal` has nowhere to put descriptions, so Jev only sees its option names.
 
@@ -172,15 +173,17 @@ Watch how often the fallback fires, not only how accurate the pair is. A chain t
 
 ## Tools: Jev picks, and calls what it can
 
-Jev cannot write a tool's arguments, but it can tell which tool a text calls for. With tools attached, every request carries one more question — which of these does the text call for — with the output type first among the options and every tool after it. Each tool is described by its docstring, and the output type by its own docstring or, without one, by the agent's instructions; with tools attached one of the two is required, since it is what filling the output is weighed against. Jev answers the question like any other, and the pick decides which path the request takes:
+Jev cannot write a tool's arguments, but it can tell which tool a text calls for. With tools attached, every request carries one more question — which of these does the text call for — with the output types first among the options and every tool after them. Each tool is described by its docstring, and each output type by its own docstring or, without one, by the agent's instructions; one of the two is required, since it is what filling that output is weighed against. Jev answers the question like any other, and the pick decides which path the request takes:
 
 | Jev picks | What runs | Language model call |
 |---|---|---|
-| the output type | Jev fills the fields, in the same request | none |
+| an output type | Jev fills its fields, in the same request or a second one after choosing a union member | none |
 | a tool with no arguments | your function, then Jev again with its result in view | none |
 | an output function with no arguments | your function, and the run ends | only if the function makes one |
 | a tool with arguments | the model behind Jev takes the whole step, tools and all | one |
 | any tool, below the threshold | Jev fills the fields; the lean is reported in `provider_details['tool']` | none |
+
+A union of structured output types takes two Jev requests: the first chooses the member, and the second asks only that member's fields. The threshold never gates an output pick, since that pick says what Jev should fill; with a tool in the same choice, a lean below the threshold falls through to the most probable output member.
 
 A tool is only taken at or above `typesafe_tool_call_threshold`. The default of 0.6 was fitted on one set of 120 labelled support tickets, where it put Jev's picks in agreement with GPT-5.6 Sol as often as Claude Opus 5 was; it is a starting point, not a general threshold, and higher hands off less and is right more often when it does. When there is no output type to fill, only output functions, the pick is the answer whatever its probability. A pick is a classification of the text, not a judgement that running the tool is safe: the framework emits the call and your function runs, exactly as on a language model's call, so a tool with no arguments that sends mail or charges an account is one Jev can set off, and approval and limits are the agent's job here as anywhere.
 
@@ -386,7 +389,7 @@ Everything below returns an answer rather than an error, which is what makes it 
 
 Jev does not write text, write a tool's arguments or read files. An agent that needs any of those is refused with a [`UserError`][pydantic_ai.exceptions.UserError] before a request is sent:
 
-- The `output_type` must be one structured type made of the field types above, beside any output functions that take no arguments: no `str`, no second type with fields, no [`NativeOutput`][pydantic_ai.output.NativeOutput] or [`PromptedOutput`][pydantic_ai.output.PromptedOutput].
+- Every member of the `output_type` must be a structured type made of the field types above, or an output function that takes no arguments: no `str`, no unsupported field hidden in a union, no [`NativeOutput`][pydantic_ai.output.NativeOutput] or [`PromptedOutput`][pydantic_ai.output.PromptedOutput].
 - No native tools. A function tool with arguments is not called by Jev either, but [proposed](#tools-jev-picks-and-calls-what-it-can) for a model behind it; with tools attached, the output type needs a docstring or the agent instructions to be weighed against them.
 - No image, audio, video or document in the prompt or the history.
 
