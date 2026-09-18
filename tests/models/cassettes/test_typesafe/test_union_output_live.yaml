@@ -1,0 +1,101 @@
+interactions:
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate, br, zstd
+      connection:
+      - keep-alive
+      content-length:
+      - '336'
+      content-type:
+      - application/json
+      host:
+      - api.typesafe.ai
+    method: POST
+    parsed_body:
+      model: jev-latest
+      questions:
+        tool:
+          criteria:
+            final_result_Escalation: Escalate a support ticket.
+            final_result_Ticket: Triage a support ticket.
+          instructions: Which of these does this call for?
+          type: choice
+      state: Checkout returns a 500 for every customer right now. Get the incident team on it.
+    uri: https://api.typesafe.ai/v1/systemone
+  response:
+    headers:
+      content-length:
+      - '255'
+      content-type:
+      - application/json
+    parsed_body:
+      answers:
+        tool:
+          choice: final_result_Escalation
+          confidence: 0.97
+          probabilities:
+            final_result_Escalation: 0.99
+            final_result_Ticket: 0.01
+          type: choice
+      model: jev-1.13.0
+      usage:
+        input_tokens: 347
+        output_tokens: 44
+    status:
+      code: 200
+      message: OK
+- request:
+    headers:
+      accept:
+      - application/json
+      accept-encoding:
+      - gzip, deflate, br, zstd
+      connection:
+      - keep-alive
+      content-length:
+      - '327'
+      content-type:
+      - application/json
+      host:
+      - api.typesafe.ai
+    method: POST
+    parsed_body:
+      model: jev-latest
+      questions:
+        team:
+          criteria:
+            billing: null
+            technical: null
+          instructions:
+            field: team
+            goal: Escalate a support ticket.
+            question: Which team should take this?
+          type: choice
+      state: Checkout returns a 500 for every customer right now. Get the incident team on it.
+    uri: https://api.typesafe.ai/v1/systemone
+  response:
+    headers:
+      content-length:
+      - '213'
+      content-type:
+      - application/json
+    parsed_body:
+      answers:
+        team:
+          choice: technical
+          confidence: 0.99
+          probabilities:
+            billing: 0.0
+            technical: 1.0
+          type: choice
+      model: jev-1.13.0
+      usage:
+        input_tokens: 336
+        output_tokens: 31
+    status:
+      code: 200
+      message: OK
+version: 1

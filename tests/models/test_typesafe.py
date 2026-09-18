@@ -370,9 +370,6 @@ async def test_fallback_on_low_confidence(allow_model_requests: None, noul: floa
     [
         pytest.param(str, 'Text output is not supported', id='text'),
         pytest.param([Handling, str], 'Text output is not supported', id='text-in-union'),
-        pytest.param(
-            [Handling, EnumAndProbability], 'Multiple output types with fields are not supported.*got 2', id='union'
-        ),
         pytest.param(NativeOutput(Handling), 'Native structured output is not supported', id='native'),
         pytest.param(PromptedOutput(Handling), 'Text output is not supported', id='prompted'),
         pytest.param(Empty, 'no fields is not supported', id='empty'),
@@ -513,6 +510,12 @@ class Ticket(BaseModel):
     urgent: bool = Field(description='Does this need a reply within the hour?')
 
 
+class Escalation(BaseModel):
+    """Escalate a support ticket."""
+
+    team: Literal['billing', 'technical'] = Field(description='Which team should take this?')
+
+
 def refund(amount: float) -> str:
     """Return a payment to the customer."""
     return f'Refunded {amount}'
@@ -531,6 +534,264 @@ def tool_answers(choice: str, probability: float) -> httpx2.Response:
             'probabilities': {choice: probability, other: rest},
         },
     )
+
+
+async def test_a_union_is_chosen_then_filled(allow_model_requests: None):
+    """The choice and chosen member are separate requests, whose usage and provider details are combined."""
+    seen: list[dict[str, Any]] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        if len(seen) == 1:
+            return answers(
+                tool={
+                    'type': 'choice',
+                    'choice': 'final_result_Escalation',
+                    'confidence': 0.1,
+                    'probabilities': {'final_result_Ticket': 0.45, 'final_result_Escalation': 0.55},
+                }
+            )
+        return answers(
+            team={
+                'type': 'choice',
+                'choice': 'technical',
+                'confidence': 0.7,
+                'probabilities': {'billing': 0.15, 'technical': 0.85},
+            }
+        )
+
+    result = await Agent(mock_model(record), output_type=Ticket | Escalation).run('Everything is down.')
+
+    assert result.output == Escalation(team='technical')
+    assert result.response.usage == RequestUsage(input_tokens=20)
+    assert result.response.provider_details == snapshot(
+        {
+            'confidence': {'team': 0.7},
+            'probabilities': {'team': {'billing': 0.15, 'technical': 0.85}},
+            'scores': {},
+            'tool': {
+                'choice': 'final_result_Escalation',
+                'probabilities': {'final_result_Ticket': 0.45, 'final_result_Escalation': 0.55},
+            },
+        }
+    )
+    assert seen == snapshot(
+        [
+            {
+                'state': 'Everything is down.',
+                'model': 'jev-latest',
+                'questions': {
+                    'tool': {
+                        'type': 'choice',
+                        'criteria': {
+                            'final_result_Ticket': 'Triage a support ticket.',
+                            'final_result_Escalation': 'Escalate a support ticket.',
+                        },
+                        'instructions': 'Which of these does this call for?',
+                    }
+                },
+            },
+            {
+                'state': 'Everything is down.',
+                'model': 'jev-latest',
+                'questions': {
+                    'team': {
+                        'type': 'choice',
+                        'criteria': {'billing': None, 'technical': None},
+                        'instructions': {
+                            'field': 'team',
+                            'question': 'Which team should take this?',
+                            'goal': 'Escalate a support ticket.',
+                        },
+                    }
+                },
+            },
+        ]
+    )
+
+
+async def test_union_members_are_described_by_their_docstring_or_instructions(allow_model_requests: None):
+    """The stock output-tool description never reaches Jev for any member."""
+    seen: list[dict[str, Any]] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        seen.append(json.loads(request.content))
+        if len(seen) == 1:
+            return answers(tool=tool_answers_for('final_result_Undescribed'))
+        return answers(urgent={'type': 'noul', 'noul': 0.9})
+
+    agent = Agent(
+        mock_model(record),
+        output_type=Ticket | Undescribed,
+        instructions='Handle a support ticket without escalation.',
+    )
+    await agent.run('anything')
+
+    assert seen[0]['questions']['tool']['criteria'] == snapshot(
+        {
+            'final_result_Ticket': 'Triage a support ticket.',
+            'final_result_Undescribed': 'Handle a support ticket without escalation.',
+        }
+    )
+
+
+async def test_an_undescribed_union_member_is_refused_before_the_choice_call(allow_model_requests: None):
+    requests = 0
+
+    def unreachable(request: httpx2.Request) -> httpx2.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError('the request should never be sent')
+
+    with pytest.raises(UserError, match='Give the output type a docstring'):
+        await Agent(mock_model(unreachable), output_type=Ticket | Undescribed).run('anything')
+    assert requests == 0
+
+
+@pytest.mark.vcr
+async def test_union_output_live(
+    allow_model_requests: None, typesafe_model: TypeSafeModel, request_capture: RequestCapture
+):
+    """The live API chooses one output type first and fills only that member on its second call."""
+    result = await Agent(typesafe_model, output_type=Ticket | Escalation).run(
+        'Checkout returns a 500 for every customer right now. Get the incident team on it.'
+    )
+
+    assert result.output == snapshot(Escalation(team='technical'))
+    assert result.response.provider_details == snapshot(
+        {
+            'confidence': {'team': 0.99},
+            'probabilities': {'team': {'billing': 0.0, 'technical': 1.0}},
+            'scores': {},
+            'tool': {
+                'choice': 'final_result_Escalation',
+                'probabilities': {'final_result_Ticket': 0.01, 'final_result_Escalation': 0.99},
+            },
+        }
+    )
+    assert len(request_capture.bodies('/v1/systemone')) == 2
+
+
+async def test_a_union_hand_off_is_called_without_filling_a_member(allow_model_requests: None):
+    """An arg-less output hand-off selected beside a union is still called directly from the choice response."""
+    seen: list[dict[str, Any]] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        seen.append(json.loads(request.content))
+        return answers(
+            tool={
+                'type': 'choice',
+                'choice': 'final_result_escalate',
+                'confidence': 0.8,
+                'probabilities': {
+                    'final_result_Ticket': 0.05,
+                    'final_result_Escalation': 0.05,
+                    'final_result_escalate': 0.9,
+                },
+            }
+        )
+
+    result = await Agent(mock_model(record), output_type=[Ticket, Escalation, escalate]).run('Get me a person.')
+
+    assert result.output == 'escalated after 2 messages'
+    assert len(seen) == 1
+    assert result.response.provider_details == snapshot(
+        {
+            'confidence': {},
+            'probabilities': {},
+            'scores': {},
+            'tool': {
+                'choice': 'final_result_escalate',
+                'probabilities': {
+                    'final_result_Ticket': 0.05,
+                    'final_result_Escalation': 0.05,
+                    'final_result_escalate': 0.9,
+                },
+            },
+        }
+    )
+
+
+async def test_a_union_tool_with_arguments_is_proposed(allow_model_requests: None):
+    """A tool with arguments selected beside a union is proposed at the same threshold as beside one output."""
+    seen: list[dict[str, Any]] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        seen.append(json.loads(request.content))
+        return answers(
+            tool={
+                'type': 'choice',
+                'choice': 'refund',
+                'confidence': 0.8,
+                'probabilities': {
+                    'final_result_Ticket': 0.05,
+                    'final_result_Escalation': 0.05,
+                    'refund': 0.9,
+                },
+            }
+        )
+
+    with pytest.raises(ToolCallProposed) as exc_info:
+        await Agent(mock_model(record), output_type=Ticket | Escalation, tools=[refund]).run('Refund me.')
+    assert exc_info.value.tool_name == 'refund'
+    assert exc_info.value.probability == 0.9
+    assert len(seen) == 1
+
+
+async def test_a_union_tool_below_threshold_fills_the_most_probable_member(allow_model_requests: None):
+    """With no single default output, a tool lean falls through to the most probable output member."""
+    seen: list[dict[str, Any]] = []
+
+    def record(request: httpx2.Request) -> httpx2.Response:
+        seen.append(json.loads(request.content))
+        if len(seen) == 1:
+            return answers(
+                tool={
+                    'type': 'choice',
+                    'choice': 'refund',
+                    'confidence': 0.2,
+                    'probabilities': {
+                        'refund': 0.59,
+                        'final_result_Ticket': 0.3,
+                        'final_result_Escalation': 0.11,
+                    },
+                }
+            )
+        return answers(urgent={'type': 'noul', 'noul': 0.9})
+
+    result = await Agent(mock_model(record), output_type=Ticket | Escalation, tools=[refund]).run('Charged twice.')
+    assert result.output == Ticket(urgent=True)
+    assert len(seen) == 2
+
+
+async def test_a_union_tool_lean_without_output_probabilities_is_unexpected(allow_model_requests: None):
+    jev = mock_model(
+        lambda _: answers(
+            tool={
+                'type': 'choice',
+                'choice': 'refund',
+                'confidence': 0.0,
+                'probabilities': {'refund': 0.5},
+            }
+        )
+    )
+    with pytest.raises(UnexpectedModelBehavior, match='probability for any offered output type'):
+        await Agent(jev, output_type=Ticket | Escalation, tools=[refund]).run('Refund me.')
+
+
+async def test_an_unexpressible_union_member_fails_before_the_choice_call(allow_model_requests: None):
+    """Every member is validated first, so an invalid union never spends a call or silently falls back."""
+    requests = 0
+
+    def unreachable(request: httpx2.Request) -> httpx2.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError('the request should never be sent')
+
+    with pytest.raises(UserError, match="Output field 'summary' is not supported"):
+        await Agent(mock_model(unreachable), output_type=Ticket | WithText).run('anything')
+    assert requests == 0
 
 
 @pytest.mark.vcr

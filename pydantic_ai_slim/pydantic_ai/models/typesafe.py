@@ -59,6 +59,7 @@ try:
         NoulAnswer,
         Score,
         ScoreAnswer,
+        SystemOneResponse,
         TypeSafeAPIConnectionError,
         TypeSafeAPIError,
         TypeSafeAPIResponseValidationError,
@@ -101,11 +102,13 @@ class TypeSafeModelSettings(ModelSettings, total=False):
     typesafe_tool_call_threshold: float
     """How likely Jev has to find a tool call before it is proposed, from 0 to 1. Default: 0.6.
 
-    With tools attached, one more question asks which tool the text calls for, the output tool among them. A tool
-    picked below this probability is a lean, and the output is filled as usual; one at or above it is raised as
-    [`ToolCallProposed`][pydantic_ai.models.typesafe.ToolCallProposed] for a model behind Jev to call. At 0.6, on
-    labelled support tickets, Jev's picks agree with a frontier model as often as two frontier models agree with each
-    other; higher hands off less, and is right more often when it does. Tune it on labelled examples of your own.
+    With tools attached, one more question asks which tool the text calls for, the output type or types among them. A
+    non-output tool picked below this probability is a lean, and the most probable output type is filled; one at or
+    above it is called or raised as [`ToolCallProposed`][pydantic_ai.models.typesafe.ToolCallProposed] for a model
+    behind Jev to call. Picking an output type is never gated: it is the result Jev should fill, not a proposal to do
+    something else. At 0.6, on labelled support tickets, Jev's picks agree with a frontier model as often as two
+    frontier models agree with each other; higher hands off less, and is right more often when it does. Tune it on
+    labelled examples of your own.
     """
 
 
@@ -138,7 +141,7 @@ class ToolCallProposed(ModelAPIError):
 
 @dataclass(init=False)
 class TypeSafeModel(Model[AsyncTypeSafeClient]):
-    """A model that fills a structured `output_type` with one request to a TypeSafe Jev model.
+    """A model that fills a structured `output_type` with one or two requests to a TypeSafe Jev model.
 
     Jev does not generate text. It answers typed questions about a text, each with a confidence. This model
     turns the output type's fields into those questions and the user prompt into the text, so an agent whose
@@ -172,6 +175,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     | `list` of a `Literal` or `Enum` | one yes or no per option | the options Jev said yes to |
     | a nested model of these | its fields, named `outer.inner` | the model |
     | `Literal[...]` or `Enum`, or `None` | pick one, or none of these | the option, or `None` |
+    | a union of structured types | pick the type, then ask its fields | the chosen type |
 
     The field description is the question. The output type's docstring and the agent's instructions go along
     as context. A docstring under an `Enum` member describes that option, see the [docs](../../models/typesafe.md);
@@ -186,14 +190,15 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     the message history, from any model, goes along beside it as `history`: user prompts, answers, tool calls
     and their results, and retry prompts.
 
-    Jev cannot write a tool's arguments, but it can tell which tool the text calls for. With tools attached, one
-    more question asks which, the output type first among the options, described by its docstring or the agent's
-    instructions. A tool that takes no arguments, or an output function that takes nothing but the run context,
-    is called on Jev's pick, so it can run a loop of such tools and hand a run off to an output function on its
-    own. A tool with arguments, picked at or above
-    `typesafe_tool_call_threshold`, is raised as [`ToolCallProposed`][pydantic_ai.models.typesafe.ToolCallProposed],
-    which a [`FallbackModel`][pydantic_ai.models.fallback.FallbackModel] with a language model behind Jev hands
-    that model, tools and all.
+    A union of structured output types takes two requests: Jev first picks the type, then answers only that type's
+    fields. Each type is described by its docstring or the agent's instructions. Jev cannot write a tool's arguments,
+    but it can tell which tool the text calls for. With tools attached, the choice also includes them. A tool that
+    takes no arguments, or an output function that takes nothing but the run context, is called on Jev's pick, so it
+    can run a loop of such tools and hand a run off to an output function on its own. A tool with arguments, picked at
+    or above `typesafe_tool_call_threshold`, is raised as
+    [`ToolCallProposed`][pydantic_ai.models.typesafe.ToolCallProposed], which a
+    [`FallbackModel`][pydantic_ai.models.fallback.FallbackModel] with a language model behind Jev hands that model,
+    tools and all. The threshold gates tools, not a pick among output types: an output pick always has fields to fill.
 
     Jev answers in one piece, so a streamed run gets the whole answer as one event rather than failing.
 
@@ -260,7 +265,7 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
     ) -> ModelResponse:
         check_allow_model_requests()
         model_settings, model_request_parameters = self.prepare_request(model_settings, model_request_parameters)
-        output_tool, hand_offs = _output_tools(model_request_parameters)
+        output_tools, hand_offs = _output_tools(model_request_parameters)
         # A withheld tool is not on any wire; one revealed through the history is, and Jev sees the whole history.
         function_tools = [
             tool
@@ -268,20 +273,66 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             if model_request_parameters.visibility_of(tool.name) != 'withheld'
         ]
         tools = _tools_left(messages, [*hand_offs, *function_tools])
-        properties = _fields(output_tool) if output_tool else {}
         state = _map_messages(messages)
         instruction_parts = self._get_instruction_parts(messages, model_request_parameters) or []
         instructions = '\n\n'.join(part.content for part in instruction_parts) or None
-        questions = _questions(properties, output_tool, instructions) if output_tool else {}
-        tool_key = _tool_question(questions, output_tool, tools, instructions)
         settings = cast(TypeSafeModelSettings, model_settings or {})
         threshold = settings.get('typesafe_tool_call_threshold', 0.6)
         if not 0 <= threshold <= 1:
             raise UserError(f'`typesafe_tool_call_threshold` must be between 0 and 1; got {threshold!r}.')
 
+        # Build every member's questions before the first request. An output Jev cannot express is a coding error,
+        # not a reason to spend one choice call before failing or to route every request to a fallback model.
+        outputs = {
+            tool.name: (tool, properties, _questions(properties, tool, instructions))
+            for tool in output_tools
+            for properties in [_fields(tool)]
+        }
+        output_tool = output_tools[0] if len(output_tools) == 1 else None
+        properties = outputs[output_tool.name][1] if output_tool else {}
+        questions = outputs[output_tool.name][2] if output_tool else {}
+        tool_key = _tool_question(questions, output_tools, tools, instructions)
+
+        response = await self._system_one(state, questions, settings)
+        response_usage = _request_usage(response)
+        args, provider_details = _answers(response.answers, properties, questions)
+        parts: list[ModelResponsePart] = []
+        if output_tool:
+            parts.append(ToolCallPart(output_tool.name, args, _utils.generate_tool_call_id()))
+        if tool_key is not None:
+            picked = _tool_call(
+                self._model_name, response.answers.get(tool_key), output_tools, tools, threshold, provider_details
+            )
+            if isinstance(picked, ToolCallPart):
+                parts = [picked]
+            elif picked is not output_tool:
+                output_tool, properties, questions = outputs[picked.name]
+                response = await self._system_one(state, questions, settings)
+                response_usage += _request_usage(response)
+                args, field_details = _answers(response.answers, properties, questions)
+                provider_details.update(field_details)
+                parts = [ToolCallPart(output_tool.name, args, _utils.generate_tool_call_id())]
+
+        return ModelResponse(
+            parts=parts,
+            usage=response_usage,
+            model_name=response.model,
+            provider_name=self._provider.name,
+            provider_url=self._provider.base_url,
+            provider_details=provider_details,
+            finish_reason='tool_call',
+        )
+
+    async def _system_one(
+        self,
+        state: JSONContent,
+        questions: dict[str, Noul | Choice | Score],
+        settings: TypeSafeModelSettings,
+    ) -> SystemOneResponse:
+        """Send one Jev request, translating SDK failures into model errors."""
         timeout = settings.get('timeout')
         try:
-            response = await self.client.system_one(
+            return await self.client.system_one(
                 state,
                 questions,
                 model=self._model_name,
@@ -301,28 +352,6 @@ class TypeSafeModel(Model[AsyncTypeSafeClient]):
             # What is left is the SDK refusing to send what it was given, such as an `extra_body` that will
             # not encode as JSON. That is the caller's to fix, not the model's.
             raise UserError(f'TypeSafe could not send this request: {e}') from e
-
-        args, provider_details = _answers(response.answers, properties, questions)
-        parts: list[ModelResponsePart] = []
-        if output_tool:
-            parts.append(ToolCallPart(output_tool.name, args, _utils.generate_tool_call_id()))
-        if tool_key is not None:
-            if call := _tool_call(
-                self._model_name, response.answers.get(tool_key), output_tool, tools, threshold, provider_details
-            ):
-                parts = [call]
-
-        return ModelResponse(
-            parts=parts,
-            usage=usage.RequestUsage(
-                input_tokens=response.usage.input_tokens or 0, output_tokens=response.usage.output_tokens or 0
-            ),
-            model_name=response.model,
-            provider_name=self._provider.name,
-            provider_url=self._provider.base_url,
-            provider_details=provider_details,
-            finish_reason='tool_call',
-        )
 
     @asynccontextmanager
     async def request_stream(
@@ -430,26 +459,42 @@ def _answers(
     return args, {'confidence': confidence, 'probabilities': probabilities, 'scores': scores}
 
 
+def _request_usage(response: SystemOneResponse) -> usage.RequestUsage:
+    """Usage for one Jev request."""
+    return usage.RequestUsage(
+        input_tokens=response.usage.input_tokens or 0, output_tokens=response.usage.output_tokens or 0
+    )
+
+
 def _tool_call(
     model_name: str,
     answer: object,
-    output_tool: ToolDefinition | None,
+    output_tools: list[ToolDefinition],
     tools: list[ToolDefinition],
     threshold: float,
     provider_details: dict[str, Any],
-) -> ToolCallPart | None:
-    """The tool call Jev makes itself from its answer to the tool question, if it takes one it can make.
+) -> ToolDefinition | ToolCallPart:
+    """The output or tool call Jev takes from its answer to the tool question.
 
-    With nothing to fill, the pick is the answer. Otherwise a tool picked below the threshold is a lean, and the
-    output is filled. A tool taken that needs arguments is raised as `ToolCallProposed` for a model behind Jev.
+    An output pick is always taken because it selects what Jev should fill, rather than proposing an external action.
+    A non-output tool below the threshold is a lean: the most probable output member is filled, which preserves the
+    single-output behavior when a union has no one default. With nothing to fill, the pick is necessarily the answer.
+    A tool taken that needs arguments is raised as `ToolCallProposed` for a model behind Jev.
     """
     if not isinstance(answer, ChoiceAnswer) or answer.choice not in answer.probabilities:
         raise UnexpectedModelBehavior(f'Unexpected answer from TypeSafe for the tool question: {answer!r}')
     probability = answer.probabilities[answer.choice]
     # The pick and its probabilities are reported either way, so the hand-off rate can be watched.
     provider_details['tool'] = {'choice': answer.choice, 'probabilities': answer.probabilities}
-    if output_tool is not None and (answer.choice == output_tool.name or probability < threshold):
-        return None
+    if output_tool := next((tool for tool in output_tools if tool.name == answer.choice), None):
+        return output_tool
+    if output_tools and probability < threshold:
+        candidates = [
+            (answer.probabilities[tool.name], tool) for tool in output_tools if tool.name in answer.probabilities
+        ]
+        if not candidates:
+            raise UnexpectedModelBehavior('TypeSafe did not return a probability for any offered output type')
+        return max(candidates, key=lambda candidate: candidate[0])[1]
     tool = next((tool for tool in tools if tool.name == answer.choice), None)
     if tool is None:
         raise UnexpectedModelBehavior(f'TypeSafe picked a tool it was not offered: {answer.choice!r}')
@@ -461,13 +506,12 @@ def _tool_call(
 
 def _output_tools(
     model_request_parameters: ModelRequestParameters,
-) -> tuple[ToolDefinition | None, list[ToolDefinition]]:
-    """The output tool with fields for Jev to fill, if there is one, and the ones that take no arguments.
+) -> tuple[list[ToolDefinition], list[ToolDefinition]]:
+    """The output tools with fields for Jev to fill and the ones that take no arguments.
 
     An output function that takes nothing, or only the run context, is a hand-off Jev can pick without writing
-    anything, so any number of them can sit beside the one output type it fills. A second output type with fields
-    would be a second set of questions with no way to choose between them, and is a `UserError`, like everything
-    else this agent could ask for that Jev cannot do.
+    anything, so any number of them can sit beside the output types. Jev first chooses among two or more output
+    types with fields, then fills the chosen one.
     """
     if model_request_parameters.allow_text_output:
         raise UserError(
@@ -478,12 +522,7 @@ def _output_tools(
     hand_offs: list[ToolDefinition] = []
     for tool in model_request_parameters.output_tools:
         (with_fields if _properties(tool.parameters_json_schema) else hand_offs).append(tool)
-    if len(with_fields) > 1:
-        raise UserError(
-            f'Multiple output types with fields are not supported by this model; got {len(with_fields)}. '
-            'Give the agent one structured `output_type`, beside any output functions that take no arguments.'
-        )
-    return (with_fields[0] if with_fields else None), hand_offs
+    return with_fields, hand_offs
 
 
 def _properties(schema: dict[str, Any]) -> dict[str, Any]:
@@ -562,6 +601,17 @@ def _options(prop: dict[str, Any]) -> dict[Any, str | None] | None:
     return None
 
 
+def _output_description(output_tool: ToolDefinition) -> str | None:
+    """The output description the user wrote, without either generated stock form."""
+    description = output_tool.description
+    if not description or description == DEFAULT_OUTPUT_TOOL_DESCRIPTION:
+        return None
+    title = output_tool.parameters_json_schema.get('title')
+    if title and description == f'{title}: {DEFAULT_OUTPUT_TOOL_DESCRIPTION}':
+        return None
+    return description
+
+
 def _ask(
     name: str, prop: dict[str, Any], output_tool: ToolDefinition, instructions: str | None
 ) -> dict[str, JSONContent]:
@@ -576,8 +626,8 @@ def _ask(
         ask['field'] = name
     if description := prop.get('description'):
         ask['question'] = description
-    if output_tool.description and output_tool.description != DEFAULT_OUTPUT_TOOL_DESCRIPTION:
-        ask['goal'] = output_tool.description
+    if description := _output_description(output_tool):
+        ask['goal'] = description
     if instructions:
         # With no field to describe, a bare output's whole question is what the agent was instructed to
         # ask, so it goes where a question goes. Alongside fields of its own it is shared framing.
@@ -674,35 +724,35 @@ def _tools_left(messages: list[ModelMessage], tools: list[ToolDefinition]) -> li
 
 def _tool_question(
     questions: dict[str, Noul | Choice | Score],
-    output_tool: ToolDefinition | None,
+    output_tools: list[ToolDefinition],
     tools: list[ToolDefinition],
     instructions: str | None,
 ) -> str | None:
-    """With tools attached, one more question: which tool the text calls for, the output tool among them.
+    """With alternatives attached, one more question: which tool the text calls for, output tools among them.
 
     Jev cannot write a tool's arguments, but it can tell which tool the text calls for, and either call it itself
-    when there are none to write or leave the call to a model behind it. The output tool is the first option,
-    described by what the agent is for, so that filling the output is an action weighed against the others. Asked
-    instead whether it *can* answer, Jev hands off nearly everything: that is a question about the question, not
-    about the text. Only what the user wrote describes the output: the output type's docstring, or failing that the
-    agent's instructions; the stock output tool description says nothing Jev could weigh a tool against.
+    when there are none to write or leave the call to a model behind it. Output tools are the first options,
+    described by what each is for, so that filling one is an action weighed against the others. Asked instead
+    whether it *can* answer, Jev hands off nearly everything: that is a question about the question, not about the
+    text. Only what the user wrote describes an output: that type's docstring, or failing that the agent's
+    instructions; the stock output tool description says nothing Jev could weigh an alternative against.
     """
-    if output_tool is None and len(tools) < 2:
+    if not output_tools and len(tools) < 2:
         raise UserError(
             'An `output_type` with no fields is not supported by this model; there is nothing to ask Jev. '
             'Give it fields, or more than one tool to pick between.'
         )
-    if not tools:
+    if len(output_tools) == 1 and not tools:
         return None
     key = 'tool'
     while key in questions:
         key += '_'
     criteria: dict[str, str | None] = {}
-    if output_tool:
-        described = output_tool.description if output_tool.description != DEFAULT_OUTPUT_TOOL_DESCRIPTION else None
+    for output_tool in output_tools:
+        described = _output_description(output_tool)
         if not (described or instructions):
             raise UserError(
-                'With tools attached, Jev weighs filling the output type against calling a tool by what each is '
+                'With alternatives attached, Jev weighs filling the output type against the others by what each is '
                 'for. Give the output type a docstring that says what filling it does, or the agent `instructions`.'
             )
         criteria[output_tool.name] = described or instructions
