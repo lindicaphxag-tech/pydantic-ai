@@ -274,6 +274,19 @@ def test_described_options_fold_into_one_enum_google():
         {'anyOf': [{'enum': ['low'], 'type': 'string'}, {'type': 'integer'}]}
     )
 
+    # One-value enums with different types are still real alternatives.
+    mixed_enum_types = {
+        'anyOf': [
+            {'enum': ['low'], 'type': 'string'},
+            {'enum': [1], 'type': 'integer'},
+        ]
+    }
+    assert GoogleJsonSchemaTransformer(deepcopy(mixed_enum_types)).walk() == snapshot(mixed_enum_types)
+
+    # Typeless, undescribed one-value enums can fold without adding either optional field.
+    typeless_undescribed = {'anyOf': [{'enum': ['low']}, {'enum': ['high']}]}
+    assert GoogleJsonSchemaTransformer(deepcopy(typeless_undescribed)).walk() == snapshot({'enum': ['low', 'high']})
+
 
 def test_typeless_anyof_member_still_recursed():
     """Control: typeless anyOf members continue to be recursed via _handle_union."""
