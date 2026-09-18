@@ -1,0 +1,29 @@
+# Union benchmark — 120 rule-labelled support tickets
+
+Rule: escalate exactly urgent account or bug tickets (32/120); urgent billing remains a ticket.
+
+## Contamination
+
+| comparison | urgent flips | area flips | either field flips | wall time |
+|---|---:|---:|---:|---:|
+| Ticket pass 1 vs Ticket pass 2 (noise floor) | 2 | 4 | 5 | 19.4 s |
+| Ticket pass 1 vs Ticket \| Escalation | 13 | 4 | 16 | 9.0 s |
+
+Both union members carry the same `urgent` and `area` fields, so all 120 answers are compared. `Escalation` adds only its reason.
+
+## Union routing
+
+| model | accuracy | hand-off rate | median | p95 | wall | cost | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Jev choose then fill | 109/120 (90.8%) | 35/120 (29.2%) | 531 ms | 892 ms | 9.0 s | unavailable | 0 |
+| Sol NativeOutput union | 112/120 (93.3%) | 30/120 (25.0%) | 2355 ms | 4259 ms | 52.8 s | $0.2682 | 0 |
+| Opus 5 NativeOutput union | 118/120 (98.3%) | 34/120 (28.3%) | 2177 ms | 3858 ms | 50.4 s | $0.7379 | 0 |
+
+## Two calls vs one flattened call
+
+| Jev shape | routing accuracy | escalation rate | median | p95 | wall | cost | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Two-call Ticket \| Escalation | 109/120 (90.8%) | 35/120 (29.2%) | 531 ms | 892 ms | 9.0 s | unavailable | 0 |
+| One-call flattened discriminator | 102/120 (85.0%) | 48/120 (40.0%) | 333 ms | 508 ms | 5.7 s | unavailable | 0 |
+
+The flattened shape has `kind` plus optional fields for the two members; the two-call shape asks only the chosen member.
