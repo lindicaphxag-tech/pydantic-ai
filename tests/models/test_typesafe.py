@@ -1748,7 +1748,11 @@ async def test_a_low_pick_stands_when_no_output_handoff_remains(allow_model_requ
         ),
     )
 
-    assert response.parts == [ToolCallPart('archive', {}, response.parts[0].tool_call_id)]
+    assert len(response.parts) == 1
+    part = response.parts[0]
+    assert isinstance(part, ToolCallPart)
+    assert part.tool_name == 'archive'
+    assert part.args_as_dict() == {}
     assert (response.provider_details or {})['tool'] == snapshot(
         {
             'choice': 'archive',
