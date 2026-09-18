@@ -454,6 +454,14 @@ async def test_unsupported_output_fields(
         await agent.run('anything')
 
 
+async def test_a_bare_boolean_union_has_no_generated_question(
+    allow_model_requests: None, typesafe_model: TypeSafeModel
+):
+    """The generated multi-output description is not a question for an undescribed primitive."""
+    with pytest.raises(UserError, match="Output field 'response' asks Jev nothing"):
+        await Agent(typesafe_model, output_type=[bool, approve]).run('anything')
+
+
 async def test_rubric_levels_are_read_in_level_order(allow_model_requests: None):
     """A rubric's levels carry their own numbers, so the order they are declared in says nothing."""
     seen: list[dict[str, Any]] = []

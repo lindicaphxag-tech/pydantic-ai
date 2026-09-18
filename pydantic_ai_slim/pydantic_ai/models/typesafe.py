@@ -669,6 +669,10 @@ def _output_description(output_tool: ToolDefinition, *, multiple_outputs: bool) 
     if not description or description == DEFAULT_OUTPUT_TOOL_DESCRIPTION:
         return None
     title = output_tool.parameters_json_schema.get('title')
+    if not title and output_tool.outer_typed_dict_key and output_tool.name.startswith('final_result_'):
+        # A bare primitive loses its schema title when the framework wraps it in `response`, but the generated
+        # multi-output tool name retains the primitive's name (for example `final_result_bool`).
+        title = output_tool.name.removeprefix('final_result_')
     if multiple_outputs and title and description == f'{title}: {DEFAULT_OUTPUT_TOOL_DESCRIPTION}':
         return None
     return description

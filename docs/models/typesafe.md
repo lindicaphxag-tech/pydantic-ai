@@ -173,7 +173,7 @@ Watch how often the fallback fires, not only how accurate the pair is. A chain t
 
 ## Tools: Jev picks, and calls what it can
 
-Jev cannot write a tool's arguments, but it can tell which tool a text calls for. With tools attached, every request carries one more question — which of these does the text call for — with the output types first among the options and every tool after them. Each tool is described by its docstring, and each output type by its own docstring or, without one, by the agent's instructions; one of the two is required, since it is what filling that output is weighed against. Jev answers the question like any other, and the pick decides which path the request takes:
+Jev cannot write a tool's arguments, but it can tell which tool a text calls for. With tools attached, the initial request carries one more question — which of these does the text call for — with the output types first among the options and every tool after them. After a union member is selected, the follow-up request asks only for that member's fields. Each tool is described by its docstring, and each output type by its own docstring or, without one, by the agent's instructions; one of the two is required, since it is what filling that output is weighed against. Jev answers the question like any other, and the pick decides which path the request takes:
 
 | Jev picks | What runs | Language model call |
 |---|---|---|
