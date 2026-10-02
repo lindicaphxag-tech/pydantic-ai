@@ -1510,6 +1510,15 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
             try:
                 if stream_error is not None:
+                    # Request wrappers read the billed-response ledger while unwinding their
+                    # `finally` blocks, so record the partial before cancelling the wrapper task.
+                    # The handler records completed responses itself; checking this flag in the
+                    # helper keeps those from being counted twice.
+                    self._record_interrupted_response_usage(
+                        wrap_request_context,
+                        agent_stream_holder[0].response if agent_stream_holder else None,
+                        already_recorded=_handler_usage_recorded,
+                    )
                     await _cancel_task(wrap_task)
                     # Capture the partial response so `capture_run_messages` and `all_messages()`
                     # include what was streamed before the interruption.
@@ -1540,6 +1549,17 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 # The event iterator is memoized on the stream, so a consumer that broke out early
                 # leaves the capability chain suspended. Close it now that the node is done with it.
                 await agent_stream_holder[0].aclose_events()
+
+    @staticmethod
+    def _record_interrupted_response_usage(
+        request_context: ModelRequestContext,
+        response: _messages.ModelResponse | None,
+        *,
+        already_recorded: bool,
+    ) -> None:
+        """Expose an interrupted response to request wrappers before they unwind."""
+        if response is not None and not already_recorded:
+            request_context._usage_response_ledger.responses.append(response)  # pyright: ignore[reportPrivateUsage]
 
     @staticmethod
     async def _commit_interrupted_response(

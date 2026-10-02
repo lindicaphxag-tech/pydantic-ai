@@ -77,6 +77,7 @@ from pydantic_ai.capabilities import (
     PrepareTools,
     RaiseContentFilterError,
     SelectModel,
+    WrapModelRequestHandler,
     WrapRunHandler,
 )
 from pydantic_ai.durable_exec._base import construction_toolsets
@@ -12765,6 +12766,50 @@ async def test_raise_content_filter_error_capability_streaming():
     assert response_msg['finish_reason'] == 'content_filter'
     assert response_msg['provider_details'] == {'finish_reason': 'content_filter'}
     assert response_msg['parts'][0]['content'] == 'Partially generated content...'
+
+
+@pytest.mark.parametrize('mode', ['normal', 'error', 'consumer'])
+async def test_model_request_usage_ledger_includes_interrupted_stream(mode: str) -> None:
+    """A request wrapper sees partial usage before its `finally` runs, without double-counting."""
+    seen: list[tuple[ModelResponse, ...]] = []
+
+    async def stream_function(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        yield 'partial response'
+        if mode == 'error':
+            raise RuntimeError('stream interrupted')
+        if mode == 'consumer':
+            await asyncio.Event().wait()
+
+    class ObserveUsageLedger(AbstractCapability):
+        async def wrap_model_request(
+            self,
+            ctx: RunContext[Any],
+            *,
+            request_context: ModelRequestContext,
+            handler: WrapModelRequestHandler,
+        ) -> ModelResponse:
+            try:
+                return await handler(request_context)
+            finally:
+                seen.append(request_context._usage_responses)  # pyright: ignore[reportPrivateUsage]
+
+    agent = Agent(FunctionModel(stream_function=stream_function), capabilities=[ObserveUsageLedger()])
+
+    if mode == 'error':
+        with pytest.raises(RuntimeError, match='stream interrupted'):
+            async with agent.run_stream('hello') as stream:
+                await stream.get_output()
+    else:
+        async with agent.run_stream('hello') as stream:
+            if mode == 'consumer':
+                async for _ in stream.stream_text():
+                    break
+            else:
+                await stream.get_output()
+
+    assert len(seen) == 1
+    assert len(seen[0]) == 1
+    assert seen[0][0].usage.output_tokens > 0
 
 
 @pytest.mark.parametrize(
