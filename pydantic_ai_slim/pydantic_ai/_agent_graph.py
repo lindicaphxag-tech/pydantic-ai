@@ -1517,6 +1517,13 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
             try:
                 if stream_error is not None:
+                    # Request wrappers such as SpendLimits and Instrumentation read the billed-response
+                    # ledger while unwinding. Record the provider's partial response before cancelling
+                    # the wrapper task; run-level usage/history is still committed exactly once below.
+                    if agent_stream_holder and not _handler_usage_recorded:
+                        wrap_request_context._usage_response_ledger.responses.append(  # pyright: ignore[reportPrivateUsage]
+                            agent_stream_holder[0].response
+                        )
                     await _cancel_task(wrap_task)
                     # Capture the partial response so `capture_run_messages` and `all_messages()`
                     # include what was streamed before the interruption.
