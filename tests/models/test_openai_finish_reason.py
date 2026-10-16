@@ -20,7 +20,7 @@ def test_unrecognized_finish_reason_is_quarantined_to_provider_details() -> None
         provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(completion)),
     )
 
-    response = model._process_response(completion)
+    response = model._process_response(completion)  # pyright: ignore[reportPrivateUsage]
 
     assert response.finish_reason is None
     assert response.provider_details is not None
