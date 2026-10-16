@@ -11,7 +11,6 @@ with pytest.importorskip("openai"):
     from openai.types.chat.chat_completion_message import ChatCompletionMessage
 
 
-@pytest.mark.vcr
 def test_unrecognized_finish_reason_is_quarantined_to_provider_details() -> None:
     completion = completion_message(ChatCompletionMessage(content="world", role="assistant"))
     completion.choices[0].finish_reason = "new_provider_reason"  # type: ignore[assignment]
