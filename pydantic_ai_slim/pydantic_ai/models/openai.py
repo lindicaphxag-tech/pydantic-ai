@@ -1543,6 +1543,12 @@ class OpenAIChatModel(Model[AsyncOpenAI]):
         # ends without one (subclasses may also handle an empty one in `_validate_completion`), but that's not reported
         # as the provider's value.
         missing_finish_reason = False
+        unrecognized_finish_reasons: list[str] = []
+        for choice in response.choices:
+            if choice.finish_reason and choice.finish_reason not in _CHAT_FINISH_REASON_MAP:
+                unrecognized_finish_reasons.append(cast(str, choice.finish_reason))
+                choice.finish_reason = None
+
         if response.choices and not (choice := response.choices[0]).finish_reason:
             missing_finish_reason = True
             if choice.finish_reason is None:
@@ -1562,6 +1568,11 @@ class OpenAIChatModel(Model[AsyncOpenAI]):
         # Moderation and service tier are top-level fields, so they're read here rather than in the choice-scoped
         # `_process_provider_details` hook that subclasses may override.
         provider_details = self._process_provider_details(response) or {}
+        if unrecognized_finish_reasons:
+            provider_details['finish_reason'] = unrecognized_finish_reasons[0]
+            if len(unrecognized_finish_reasons) > 1:
+                provider_details['finish_reasons'] = unrecognized_finish_reasons
+
         if response.moderation:
             provider_details['moderation'] = response.moderation.model_dump()
         if response.service_tier:
